@@ -1,3 +1,4 @@
+#include <string.h>
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "hardware/clocks.h"
@@ -31,7 +32,18 @@ typedef struct i2c_dma_s {
   uint16_t data_cmds[I2C_MAX_TRANSFER_SIZE];
 } i2c_dma_t;
 
-static i2c_dma_t i2c_dma_list[2];
+static i2c_dma_t i2c_dma_list[NUM_I2CS];
+
+struct i2c_dma_xfer_s
+{
+  i2c_dma_t* i2c_dma;
+  uint8_t addr;
+  uint8_t* rbuf;
+  size_t rbuf_len;
+  size_t wbuf_len;
+};
+
+static struct i2c_dma_xfer_s i2c_dma_xfer_list[NUM_I2CS];
 
 static void i2c_dma_irq_handler(i2c_dma_t *i2c_dma) {
   const uint32_t status = i2c_get_hw(i2c_dma->i2c)->intr_stat;
@@ -210,11 +222,13 @@ int i2c_dma_init(
     i2c_dma->i2c = i2c0;
     i2c_dma->irq_num = I2C0_IRQ;
     i2c_dma->irq_handler = i2c0_dma_irq_handler;
+    memset(&i2c_dma_xfer_list[0], 0, sizeof(struct i2c_dma_xfer_s));
   } else {
     i2c_dma = &i2c_dma_list[1];
     i2c_dma->i2c = i2c1;
     i2c_dma->irq_num = I2C1_IRQ;
     i2c_dma->irq_handler = i2c1_dma_irq_handler;
+    memset(&i2c_dma_xfer_list[1], 0, sizeof(struct i2c_dma_xfer_s));
   }
 
   *pi2c_dma = i2c_dma;
@@ -236,7 +250,7 @@ int i2c_dma_init(
   return i2c_dma_init_intern(i2c_dma);
 }
 
-static int i2c_dma_write_read_internal(
+int i2c_dma_write_read(
   i2c_dma_t *i2c_dma,
   uint8_t addr,
   const uint8_t *wbuf,
@@ -244,69 +258,175 @@ static int i2c_dma_write_read_internal(
   uint8_t *rbuf,
   size_t rbuf_len
 ) {
+  int rc = PICO_OK;
+
+  i2c_dma_xfer_t xfer = i2c_dma_xfer_init(i2c_dma, addr);
+  if (xfer == NULL)
+    return PICO_ERROR_GENERIC;
+
+  rc = i2c_dma_xfer_write(xfer, wbuf, wbuf_len);
+  if (rc != PICO_OK) {
+    i2c_dma_xfer_abort(xfer);
+    return rc;
+  }
+
+  if (rbuf) {
+    rc = i2c_dma_xfer_read(xfer, rbuf, rbuf_len);
+    if (rc != PICO_OK) {
+      i2c_dma_xfer_abort(xfer);
+      return rc;
+    }
+  }
+
+  rc = i2c_dma_xfer_execute(xfer);
+  return rc;
+}
+
+i2c_dma_xfer_t i2c_dma_xfer_init(
+  i2c_dma_t *i2c_dma,
+  uint8_t addr
+) {
+  if (xSemaphoreTake(
+      i2c_dma->mutex, I2C_TAKE_MUTEX_TIMEOUT_MS * portTICK_PERIOD_MS
+    ) != pdTRUE) {
+    return NULL;
+  }
+
+  size_t i = i2c_dma->i2c == i2c0 ? 0 : 1;
+  i2c_dma_xfer_t xfer = &i2c_dma_xfer_list[i];
+
+  if (xfer->i2c_dma || xfer->addr || xfer->rbuf || xfer->rbuf_len || xfer->wbuf_len)
+    return NULL;
+
+  xfer->i2c_dma = i2c_dma;
+  xfer->addr = addr;
+
+  return xfer;
+}
+
+int i2c_dma_xfer_write(
+  i2c_dma_xfer_t xfer,
+  const uint8_t* wbuf,
+  size_t wbuf_len
+) {
   if (
-    (wbuf_len > 0 && wbuf == NULL) ||
-    (rbuf_len > 0 && rbuf == NULL) ||
-    (wbuf_len == 0 && rbuf_len == 0) ||
-    (wbuf_len + rbuf_len > I2C_MAX_TRANSFER_SIZE)
+    (xfer == NULL) ||
+    (xfer->i2c_dma == NULL) ||
+    (wbuf == NULL) ||
+    (wbuf_len == 0)
   ) {
     return PICO_ERROR_INVALID_ARG;
   }
 
-  const bool writing = (wbuf_len > 0);
-  const bool reading = (rbuf_len > 0);
+  // Read must follow write.
+  if (xfer->rbuf_len > 0)
+    return PICO_ERROR_NOT_PERMITTED;
 
-  int tx_chan = 0; // Channel for writing data_cmds to I2C peripheral.
-  int rx_chan = 0; // Channel for reading data from I2C peripheral, if needed.
+  if (xfer->wbuf_len + wbuf_len > I2C_MAX_TRANSFER_SIZE)
+    return PICO_ERROR_INSUFFICIENT_RESOURCES;
 
-  if (writing) {
-    // Setup commands for each byte to write to the I2C bus.
-    for (size_t i = 0; i != wbuf_len; ++i) {
-      i2c_dma->data_cmds[i] = wbuf[i];
-    }
-
-    // The first byte written must be preceded by a start.
-    i2c_dma->data_cmds[0] |= I2C_IC_DATA_CMD_RESTART_BITS;
+  // Setup commands for each byte to write to the I2C bus.
+  for (size_t i = 0; i != wbuf_len; ++i) {
+    xfer->i2c_dma->data_cmds[i + xfer->wbuf_len] = wbuf[i];
   }
+
+  if (xfer->wbuf_len == 0) {
+    // The first byte written must be preceded by a start.
+    xfer->i2c_dma->data_cmds[0] |= I2C_IC_DATA_CMD_RESTART_BITS;
+  }
+
+  xfer->wbuf_len += wbuf_len;
+
+  return PICO_OK;
+}
+
+int i2c_dma_xfer_read(
+  i2c_dma_xfer_t xfer,
+  uint8_t* rbuf,
+  size_t rbuf_len
+) {
+  if (
+    (xfer == NULL) ||
+    (xfer->i2c_dma == NULL) ||
+    (rbuf == NULL) ||
+    (rbuf_len == 0)
+  ) {
+    return PICO_ERROR_INVALID_ARG;
+  }
+
+  // Can only do one read per xfer.
+  if (xfer->rbuf != NULL || xfer->rbuf_len > 0)
+    return PICO_ERROR_NOT_PERMITTED;
+
+  if (xfer->wbuf_len + rbuf_len > I2C_MAX_TRANSFER_SIZE)
+    return PICO_ERROR_INSUFFICIENT_RESOURCES;
+
+  // Setup commands for each byte to read from the I2C bus.
+  for (size_t i = 0; i != rbuf_len; ++i) {
+    xfer->i2c_dma->data_cmds[xfer->wbuf_len + i] = I2C_IC_DATA_CMD_CMD_BITS;
+  }
+
+  // The first byte read must be preceded by a start/restart.
+  xfer->i2c_dma->data_cmds[xfer->wbuf_len] |= I2C_IC_DATA_CMD_RESTART_BITS;
+
+  xfer->rbuf = rbuf;
+  xfer->rbuf_len = rbuf_len;
+
+  return PICO_OK;
+}
+
+int i2c_dma_xfer_execute(
+  i2c_dma_xfer_t xfer
+) {
+  if (
+    (xfer == NULL) ||
+    (xfer->i2c_dma == NULL) ||
+    (xfer->wbuf_len == 0 && xfer->rbuf_len == 0) ||
+    (xfer->wbuf_len + xfer->rbuf_len > I2C_MAX_TRANSFER_SIZE)
+  ) {
+    return PICO_ERROR_INVALID_ARG;
+  }
+
+  i2c_dma_t* i2c_dma = xfer->i2c_dma;
+  int rc = PICO_OK;
+
+  const bool writing = (xfer->wbuf_len > 0);
+  const bool reading = (xfer->rbuf_len > 0);
+
+  int tx_chan = -1; // Channel for writing data_cmds to I2C peripheral.
+  int rx_chan = -1; // Channel for reading data from I2C peripheral, if needed.
 
   // DMA tx_chan is needed for both writing and reading.
   tx_chan = dma_claim_unused_channel(false);
   if (tx_chan == -1) {
-    return PICO_ERROR_GENERIC;
+    rc = PICO_ERROR_GENERIC;
+    goto err;
   }
 
   if (reading) {
-    // Setup commands for each byte to read from the I2C bus.
-    for (size_t i = 0; i != rbuf_len; ++i) {
-      i2c_dma->data_cmds[wbuf_len + i] = I2C_IC_DATA_CMD_CMD_BITS;
-    }
-
-    // The first byte read must be preceded by a start/restart.
-    i2c_dma->data_cmds[wbuf_len] |= I2C_IC_DATA_CMD_RESTART_BITS;
-
     // DMA rx_chan is only needed for reading.
     rx_chan = dma_claim_unused_channel(false);
     if (rx_chan == -1) {
-      dma_channel_unclaim(tx_chan);
-      return PICO_ERROR_GENERIC;
+      rc = PICO_ERROR_GENERIC;
+      goto err;
     }
   }
 
   // The last byte transfered must be followed by a stop.
-  i2c_dma->data_cmds[wbuf_len + rbuf_len - 1] |= I2C_IC_DATA_CMD_STOP_BITS;
+  i2c_dma->data_cmds[xfer->wbuf_len + xfer->rbuf_len - 1] |= I2C_IC_DATA_CMD_STOP_BITS;
 
   // Tell the I2C peripheral the adderss of the device for the transfer.
-  i2c_dma_set_target_addr(i2c_dma->i2c, addr);
+  i2c_dma_set_target_addr(i2c_dma->i2c, xfer->addr);
 
   i2c_dma->stop_detected = false;
   i2c_dma->abort_detected = false;
 
   // Start the I2C transfer on required DMA channels.
   if (reading) {
-    i2c_dma_rx_channel_configure(i2c_dma->i2c, rx_chan, rbuf, rbuf_len);
+    i2c_dma_rx_channel_configure(i2c_dma->i2c, rx_chan, xfer->rbuf, xfer->rbuf_len);
   }
   i2c_dma_tx_channel_configure(
-    i2c_dma->i2c, tx_chan, i2c_dma->data_cmds, wbuf_len + rbuf_len
+    i2c_dma->i2c, tx_chan, i2c_dma->data_cmds, xfer->wbuf_len + xfer->rbuf_len
   );
 
   // The I2C transfer via DMA has been started. Wait for it to complete. Under
@@ -327,13 +447,14 @@ static int i2c_dma_write_read_internal(
     }
   }
 
+err:
   // Free the DMA channels.
-  dma_channel_unclaim(tx_chan);
-  if (reading) {
+  if (tx_chan != -1) {
+    dma_channel_unclaim(tx_chan);
+  }
+  if (rx_chan != -1) {
     dma_channel_unclaim(rx_chan);
   }
-
-  int rc = PICO_OK;
 
   if (timeout) {
     rc = PICO_ERROR_TIMEOUT;
@@ -346,31 +467,28 @@ static int i2c_dma_write_read_internal(
     i2c_dma_reinit(i2c_dma);
   }
 
-  return rc;
-}
-
-int i2c_dma_write_read(
-  i2c_dma_t *i2c_dma,
-  uint8_t addr,
-  const uint8_t *wbuf,
-  size_t wbuf_len,
-  uint8_t *rbuf,
-  size_t rbuf_len
-) {
-  if (xSemaphoreTake(
-      i2c_dma->mutex, I2C_TAKE_MUTEX_TIMEOUT_MS * portTICK_PERIOD_MS
-    ) != pdTRUE) {
-    return PICO_ERROR_TIMEOUT;
-  }
-
-  const int rc = i2c_dma_write_read_internal(
-    i2c_dma, addr, wbuf, wbuf_len, rbuf, rbuf_len
-  );
-
   if (xSemaphoreGive(i2c_dma->mutex) != pdTRUE && rc == PICO_OK) {
-    return PICO_ERROR_GENERIC;
+    rc = PICO_ERROR_GENERIC;
   }
+
+  memset(xfer, 0, sizeof(struct i2c_dma_xfer_s));
 
   return rc;
 }
 
+int i2c_dma_xfer_abort(
+  i2c_dma_xfer_t xfer
+) {
+  if (xfer == NULL)
+    return PICO_ERROR_INVALID_ARG;
+
+  int rc = PICO_OK;
+
+  if (xSemaphoreGive(xfer->i2c_dma->mutex) != pdTRUE) {
+    rc = PICO_ERROR_GENERIC;
+  }
+
+  memset(xfer, 0, sizeof(struct i2c_dma_xfer_s));
+
+  return rc;
+}

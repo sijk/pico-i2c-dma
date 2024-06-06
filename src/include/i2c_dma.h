@@ -143,7 +143,7 @@ static inline int i2c_dma_read(
 }
 
 // Writes a byte to a register.
-// 
+//
 // I2C Transaction:
 // S addr Wr [A] reg [A] byte [A] P
 //
@@ -172,7 +172,7 @@ static inline int i2c_dma_write_byte(
 }
 
 // Reads a byte from a register.
-// 
+//
 // I2C Transaction:
 // S addr Wr [A] reg [A] Sr addr Rd [A] [byte] NA P
 //
@@ -318,6 +318,96 @@ static inline int i2c_dma_read_word_swapped(
   *word = *word << 8 | *word >> 8;
   return rc;
 }
+
+// An i2c_dma_xfer_t stores all the data required by the i2c_dma_xfer_*
+// functions. Call i2c_dma_xfer_init() to begin setting up a transfer.
+typedef struct i2c_dma_xfer_s* i2c_dma_xfer_t;
+
+// Prepares an I2C DMA transfer. A transfer consists of zero or more writes
+// followed by zero or one read. Once the transfer has been set up with
+// i2c_dma_xfer_write() and i2c_dma_xfer_read(), call i2c_dma_xfer_execute()
+// to actually execute the transfer. If any of the write/read calls fail then
+// call i2c_dma_xfer_abort() to clean up the transfer without executing it.
+// This allows assembling transfers piecemeal before executing them.
+//
+// Returns
+//   !NULL
+//     Function completed successfully
+//   NULL
+//     Timeout waiting to take a mutex
+//     Transfer already in progress
+i2c_dma_xfer_t i2c_dma_xfer_init(
+  i2c_dma_t *i2c_dma,
+  uint8_t addr
+);
+
+// Append bytes to the write phase of the given transfer.
+//
+// Returns
+//   PICO_OK
+//     Function completed successfully
+//   PICO_ERROR_INVALID_ARG
+//     Invalid argument passed to function
+//   PICO_ERROR_NOT_PERMITTED
+//     Attempted to write after read
+//   PICO_ERROR_INSUFFICIENT_RESOURCES
+//     Not enough space in the transfer buffer
+int i2c_dma_xfer_write(
+  i2c_dma_xfer_t xfer,
+  const uint8_t* wbuf,
+  size_t wbuf_len
+);
+
+// Set up the read phase of the given transfer.
+//
+// Returns
+//   PICO_OK
+//     Function completed successfully
+//   PICO_ERROR_INVALID_ARG
+//     Invalid argument passed to function
+//   PICO_ERROR_NOT_PERMITTED
+//     Attempted to set up multiple reads in one transfer
+//   PICO_ERROR_INSUFFICIENT_RESOURCES
+//     Not enough space in the transfer buffer
+int i2c_dma_xfer_read(
+  i2c_dma_xfer_t xfer,
+  uint8_t* rbuf,
+  size_t rbuf_len
+);
+
+// Execute the given transfer. See i2c_dma_write_read() for a description of
+// the protocol phases.
+//
+// Returns
+//   PICO_OK
+//     Function completed successfully
+//   PICO_ERROR_INVALID_ARG
+//     Invalid argument passed to function
+//   PICO_ERROR_TIMEOUT
+//     Timeout waiting for I2C transaction to complete
+//   PICO_ERROR_IO
+//     I2C transaction aborted by I2C peripheral
+//     No stop condition for transaction detected by I2C peripheral
+//   PICO_ERROR_GENERIC
+//     Error attempting to give a mutex
+//     Error attemptimg to claim a DMA channel
+int i2c_dma_xfer_execute(
+  i2c_dma_xfer_t xfer
+);
+
+// Clean up a transfer without executing it. This must be called if any
+// write/read calls fail while setting up a transfer.
+//
+// Returns
+//   PICO_OK
+//     Function completed successfully
+//   PICO_ERROR_INVALID_ARG
+//     Invalid argument passed to function
+//   PICO_ERROR_GENERIC
+//     Error attempting to give a mutex
+int i2c_dma_xfer_abort(
+  i2c_dma_xfer_t xfer
+);
 
 #ifdef __cplusplus
 }
